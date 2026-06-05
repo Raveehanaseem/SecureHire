@@ -1,0 +1,51 @@
+# Falco Rules — SecureHire Runtime Security
+# CYC386 Requirement: Falco runtime monitoring
+
+- rule: Unexpected Network Connection from API Container
+  desc: Detect outbound connections from securehire_backend to unexpected IPs
+  condition: >
+    container.name = "securehire_backend" and
+    evt.type = connect and
+    not fd.snet in (127.0.0.1/32, 172.16.0.0/12)
+  output: >
+    Unexpected network connection from API container
+    (container=%container.name ip=%fd.rip port=%fd.rport)
+  priority: WARNING
+  tags: [network, securehire]
+
+- rule: Shell Spawned in Container
+  desc: Alert if a shell is spawned inside any SecureHire container
+  condition: >
+    container.name startswith "securehire_" and
+    evt.type = execve and
+    proc.name in (bash, sh, zsh, dash, ksh)
+  output: >
+    Shell spawned in container
+    (container=%container.name shell=%proc.name user=%user.name)
+  priority: CRITICAL
+  tags: [shell, securehire]
+
+- rule: Sensitive File Read in Container
+  desc: Detect reads of /etc/passwd or /etc/shadow inside containers
+  condition: >
+    container.name startswith "securehire_" and
+    evt.type = open and
+    fd.name in (/etc/passwd, /etc/shadow, /etc/sudoers)
+  output: >
+    Sensitive file read in container
+    (container=%container.name file=%fd.name proc=%proc.name)
+  priority: ERROR
+  tags: [file, securehire]
+
+- rule: Write to /app Outside Logs
+  desc: Alert on writes to non-log paths in the backend container
+  condition: >
+    container.name = "securehire_backend" and
+    evt.type in (write, creat) and
+    fd.directory startswith "/app" and
+    not fd.directory startswith "/app/logs"
+  output: >
+    Unexpected write in backend container
+    (container=%container.name path=%fd.name)
+  priority: WARNING
+  tags: [file, securehire]
