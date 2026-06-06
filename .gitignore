@@ -1,0 +1,6 @@
+minikube-linux-amd64
+vault_1.16.1_linux_amd64.zip
+terraform_1.8.1_linux_amd64.zip
+*.zip
+.terraform/
+venv/
