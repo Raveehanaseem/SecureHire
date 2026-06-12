@@ -282,72 +282,158 @@ jobs:
           echo "ZAP_TOKEN=$TOKEN" >> $GITHUB_ENV
           echo "Token captured (length: ${#TOKEN})"
 
-      # ── Baseline scan — passive only, no active attacks ──────────────────
-      # Good for PRs: fast (~2 min), zero false-positive risk
+      # ── Create output directory (ZAP writes reports here) ────────────────
+      - name: Prepare ZAP Output Directory
+        run: |
+          mkdir -p zap-reports
+          chmod 777 zap-reports
+
+      # ── Baseline scan — passive only, runs ZAP directly via Docker ────────
+      # Bypasses the zaproxy/action-baseline artifact-naming bug entirely.
+      # Uses host networking so ZAP container can reach localhost:8000.
       - name: ZAP Baseline Scan (passive)
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: http://localhost:8000
-          rules_file_name: .zap/rules.tsv
-          cmd_options: >-
-            -z "-config replacer.full_list(0).description=auth
-                -config replacer.full_list(0).enabled=true
-                -config replacer.full_list(0).matchtype=REQ_HEADER
-                -config replacer.full_list(0).matchstr=Authorization
-                -config replacer.full_list(0).replacement=Bearer__ZAP_AUTH_HEADER_VALUE__"
-          allow_issue_writing: false
-          fail_action: false
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/.zap:/zap/wrk/.zap:ro" \
+            -v "${{ github.workspace }}/zap-reports:/zap/wrk/reports" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://localhost:8000 \
+              -r reports/baseline-report.html \
+              -J reports/baseline-report.json \
+              -x reports/baseline-report.xml \
+              -c .zap/rules.tsv \
+              -z "-config replacer.full_list(0).description=auth \
+                  -config replacer.full_list(0).enabled=true \
+                  -config replacer.full_list(0).matchtype=REQ_HEADER \
+                  -config replacer.full_list(0).matchstr=Authorization \
+                  -config replacer.full_list(0).replacement='Bearer ${{ env.ZAP_TOKEN }}'" \
+              -I || true
+          echo "Baseline scan complete"
 
-      # ── Full API scan using OpenAPI spec ─────────────────────────────────
-      # Targets every documented endpoint with the JWT token injected
-      - name: ZAP Full API Scan
-        uses: zaproxy/action-api-scan@v0.7.0
-        with:
-          target: http://localhost:8000/api/openapi.json
-          format: openapi
-          cmd_options: >-
-            -z "-config replacer.full_list(0).description=auth
-                -config replacer.full_list(0).enabled=true
-                -config replacer.full_list(0).matchtype=REQ_HEADER
-                -config replacer.full_list(0).matchstr=Authorization
-                -config replacer.full_list(0).replacement=Bearer ${{ env.ZAP_TOKEN }}"
-          allow_issue_writing: false
-          fail_action: false
+      # ── Full API scan — active, uses OpenAPI spec ─────────────────────────
+      - name: ZAP Full API Scan (active)
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/.zap:/zap/wrk/.zap:ro" \
+            -v "${{ github.workspace }}/zap-reports:/zap/wrk/reports" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py \
+              -t http://localhost:8000/api/openapi.json \
+              -f openapi \
+              -r reports/api-scan-report.html \
+              -J reports/api-scan-report.json \
+              -x reports/api-scan-report.xml \
+              -c .zap/rules.tsv \
+              -z "-config replacer.full_list(0).description=auth \
+                  -config replacer.full_list(0).enabled=true \
+                  -config replacer.full_list(0).matchtype=REQ_HEADER \
+                  -config replacer.full_list(0).matchstr=Authorization \
+                  -config replacer.full_list(0).replacement='Bearer ${{ env.ZAP_TOKEN }}'" \
+              -I || true
+          echo "API scan complete"
 
-      # Upload ZAP SARIF report to GitHub Security tab
-      - name: Upload ZAP SARIF to Security tab
+      # ── Convert XML report to SARIF for GitHub Security tab ──────────────
+      - name: Convert ZAP XML to SARIF
+        if: always()
+        run: |
+          pip install zaproxy --quiet
+          python3 - << 'EOF'
+          import json, xml.etree.ElementTree as ET, os
+
+          def xml_to_sarif(xml_path, output_path):
+              if not os.path.exists(xml_path):
+                  print(f"Skipping {xml_path} — file not found")
+                  return
+              tree = ET.parse(xml_path)
+              root = tree.getroot()
+              rules, results = [], []
+              for alert in root.iter('alertitem'):
+                  rule_id  = alert.findtext('pluginid', 'unknown')
+                  name     = alert.findtext('alert', 'Unknown Alert')
+                  desc     = alert.findtext('desc', '')
+                  solution = alert.findtext('solution', '')
+                  risk     = alert.findtext('riskcode', '0')
+                  level    = {'3':'error','2':'warning','1':'note','0':'none'}.get(risk,'warning')
+                  uri      = alert.findtext('uri', 'http://localhost:8000')
+                  rules.append({
+                      "id": rule_id,
+                      "name": name.replace(' ','-'),
+                      "shortDescription": {"text": name},
+                      "fullDescription": {"text": desc},
+                      "help": {"text": solution, "markdown": solution},
+                      "properties": {"security-severity": {'3':'9.0','2':'6.5','1':'3.0','0':'0.0'}.get(risk,'5.0')}
+                  })
+                  results.append({
+                      "ruleId": rule_id,
+                      "level": level,
+                      "message": {"text": f"{name}: {desc[:200]}"},
+                      "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri}}}]
+                  })
+              sarif = {
+                  "version": "2.1.0",
+                  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                  "runs": [{"tool": {"driver": {"name":"OWASP ZAP","rules": rules}}, "results": results}]
+              }
+              os.makedirs(os.path.dirname(output_path), exist_ok=True)
+              with open(output_path, 'w') as f:
+                  json.dump(sarif, f, indent=2)
+              print(f"SARIF written to {output_path} ({len(results)} findings)")
+
+          xml_to_sarif('zap-reports/reports/api-scan-report.xml', 'zap-reports/zap-api.sarif')
+          xml_to_sarif('zap-reports/reports/baseline-report.xml', 'zap-reports/zap-baseline.sarif')
+          EOF
+
+      # ── Upload SARIF to GitHub Security tab ───────────────────────────────
+      - name: Upload ZAP API Scan SARIF
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: results/zap-scan-results.sarif
-          category: zap-dast
+          sarif_file: zap-reports/zap-api.sarif
+          category: zap-api-scan
 
-      # Save full HTML report as a downloadable artifact
-      - name: Upload ZAP HTML Report
+      - name: Upload ZAP Baseline SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: zap-reports/zap-baseline.sarif
+          category: zap-baseline
+
+      # ── Save HTML + JSON reports as artifact ─────────────────────────────
+      - name: Upload ZAP Reports Artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zap-dast-report
-          path: |
-            report_html.html
-            report_json.json
-            results/
+          name: securehire-zap-dast-reports
+          path: zap-reports/reports/
           retention-days: 30
+          if-no-files-found: warn
 
-      - name: Summarise ZAP Findings
+      # ── Print summary to GitHub Actions job summary page ─────────────────
+      - name: ZAP Scan Summary
         if: always()
         run: |
-          echo "## ZAP DAST Scan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | http://localhost:8000 |" >> $GITHUB_STEP_SUMMARY
-          echo "| Spec   | /api/openapi.json |" >> $GITHUB_STEP_SUMMARY
-          echo "| Report | See artifact: zap-dast-report |" >> $GITHUB_STEP_SUMMARY
-          if [ -f report_json.json ]; then
-            HIGH=$(python3 -c "import json; d=json.load(open('report_json.json')); \
-              print(sum(1 for s in d.get('site',[]) for a in s.get('alerts',[]) if a.get('riskcode') in ['3','2']))" 2>/dev/null || echo "N/A")
-            echo "| High/Medium alerts | $HIGH |" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "## OWASP ZAP DAST Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan | Report |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Baseline (passive) | \`zap-reports/reports/baseline-report.html\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Scan (active)  | \`zap-reports/reports/api-scan-report.html\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SARIF              | GitHub Security tab → Code Scanning |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for f in zap-reports/reports/*.json; do
+            [ -f "$f" ] || continue
+            COUNT=$(python3 -c "
+          import json, sys
+          d = json.load(open('$f'))
+          alerts = [a for s in d.get('site',[]) for a in s.get('alerts',[])]
+          high   = sum(1 for a in alerts if a.get('riskcode') == '3')
+          med    = sum(1 for a in alerts if a.get('riskcode') == '2')
+          low    = sum(1 for a in alerts if a.get('riskcode') == '1')
+          print(f'High={high} Medium={med} Low={low}')
+          " 2>/dev/null || echo "parse error")
+            echo "**$(basename $f)**: $COUNT" >> $GITHUB_STEP_SUMMARY
+          done
 
   build:
     name: Build Docker Images
