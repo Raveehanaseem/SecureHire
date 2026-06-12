@@ -338,24 +338,51 @@ jobs:
           ls -la "${{ github.workspace }}/zap-reports/reports/" || true
 
       # ── Convert ZAP XML → SARIF ───────────────────────────────────────────
-      # FIX 4: always writes a valid (possibly empty) SARIF so upload never
-      #         fails with "path does not exist". Deduplicated rules by pluginid.
+      # GitHub Code Scanning REJECTS http:// URIs in artifactLocation.
+      # It requires relative file:// paths anchored to %SRCROOT%.
+      # We map each scanned URL path to its likely source file, e.g.:
+      #   http://localhost:8000/api/v1/jobs  →  src/backend/routers/jobs.py
+      # Unknown URLs fall back to src/backend/main.py so upload never fails.
       - name: Convert ZAP XML to SARIF
         if: always()
         run: |
           python3 << 'PYEOF'
-          import json, os, xml.etree.ElementTree as ET
+          import json, os, re, xml.etree.ElementTree as ET
+          from urllib.parse import urlparse
 
           EMPTY_SARIF = {
               "version": "2.1.0",
               "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-              "runs": [{"tool": {"driver": {"name": "OWASP ZAP", "rules": []}}, "results": []}]
+              "runs": [{
+                  "tool": {"driver": {"name": "OWASP ZAP", "version": "2.14", "rules": []}},
+                  "results": [],
+                  "originalUriBaseIds": {"%SRCROOT%": {"uri": "file:///src/"}}
+              }]
           }
+
+          # Map URL path prefixes → relative source file paths
+          URL_TO_FILE = [
+              (r"/api/v1/auth",         "backend/routers/auth.py"),
+              (r"/api/v1/jobs",         "backend/routers/jobs.py"),
+              (r"/api/v1/applications", "backend/routers/applications.py"),
+              (r"/api/v1/users",        "backend/routers/users.py"),
+              (r"/api/v1/admin",        "backend/routers/admin.py"),
+              (r"/api/openapi",         "backend/main.py"),
+              (r"/health",              "backend/main.py"),
+              (r"/",                    "backend/main.py"),
+          ]
+
+          def url_to_relative_path(url):
+              path = urlparse(url).path or "/"
+              for pattern, filepath in URL_TO_FILE:
+                  if re.match(pattern, path):
+                      return filepath
+              return "backend/main.py"
 
           def xml_to_sarif(xml_path, out_path):
               os.makedirs(os.path.dirname(out_path), exist_ok=True)
               if not os.path.exists(xml_path):
-                  print(f"WARNING: {xml_path} not found — writing empty SARIF to {out_path}")
+                  print(f"WARNING: {xml_path} not found — writing empty SARIF")
                   with open(out_path, 'w') as f:
                       json.dump(EMPTY_SARIF, f, indent=2)
                   return
@@ -367,30 +394,38 @@ jobs:
               level_map    = {'3': 'error', '2': 'warning', '1': 'note', '0': 'none'}
 
               for alert in root.iter('alertitem'):
-                  rid  = alert.findtext('pluginid', 'unknown')
-                  name = alert.findtext('alert', 'Unknown Alert')
-                  desc = (alert.findtext('desc', '') or '')[:500]
-                  soln = (alert.findtext('solution', '') or '')[:500]
-                  risk = alert.findtext('riskcode', '0')
-                  uri  = alert.findtext('uri', 'http://localhost:8000') or 'http://localhost:8000'
+                  rid    = alert.findtext('pluginid', 'unknown')
+                  name   = alert.findtext('alert', 'Unknown Alert')
+                  desc   = (alert.findtext('desc',     '') or '')[:500]
+                  soln   = (alert.findtext('solution', '') or '')[:500]
+                  risk   = alert.findtext('riskcode', '0')
+                  raw_url = alert.findtext('uri', 'http://localhost:8000') or 'http://localhost:8000'
+                  # Convert http URL → relative file path (what GitHub requires)
+                  rel_path = url_to_relative_path(raw_url)
 
                   if rid not in seen_rules:
                       seen_rules.add(rid)
                       rules.append({
                           "id": rid,
-                          "name": name.replace(' ', '-'),
+                          "name": name.replace(' ', ''),
                           "shortDescription": {"text": name},
                           "fullDescription":  {"text": desc},
                           "help":             {"text": soln, "markdown": soln},
-                          "properties":       {"security-severity": severity_map.get(risk, '5.0')}
+                          "properties":       {"security-severity": severity_map.get(risk, '5.0'),
+                                               "tags": ["security", "ZAP"]}
                       })
+
                   results.append({
                       "ruleId":  rid,
                       "level":   level_map.get(risk, 'warning'),
-                      "message": {"text": f"{name}: {desc[:200]}"},
+                      "message": {"text": f"{name} at {raw_url}"},
                       "locations": [{
                           "physicalLocation": {
-                              "artifactLocation": {"uri": uri, "uriBaseId": "%SRCROOT%"}
+                              "artifactLocation": {
+                                  "uri": rel_path,
+                                  "uriBaseId": "%SRCROOT%"
+                              },
+                              "region": {"startLine": 1}
                           }
                       }]
                   })
@@ -398,7 +433,15 @@ jobs:
               sarif = {
                   "version": "2.1.0",
                   "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-                  "runs": [{"tool": {"driver": {"name": "OWASP ZAP", "rules": rules}}, "results": results}]
+                  "runs": [{
+                      "tool": {"driver": {"name": "OWASP ZAP", "version": "2.14",
+                                          "informationUri": "https://www.zaproxy.org",
+                                          "rules": rules}},
+                      "results": results,
+                      "originalUriBaseIds": {
+                          "%SRCROOT%": {"uri": "file:///home/runner/work/SecureHire/SecureHire/securehire/src/"}
+                      }
+                  }]
               }
               with open(out_path, 'w') as f:
                   json.dump(sarif, f, indent=2)
@@ -409,8 +452,10 @@ jobs:
           xml_to_sarif(f"{BASE}/reports/api-scan-report.xml", f"{BASE}/zap-api.sarif")
           PYEOF
 
-          echo "=== SARIF files ==="
-          ls -lh "${{ github.workspace }}/zap-reports/"*.sarif 2>/dev/null || echo "No SARIF files found"
+          echo "=== SARIF files written ==="
+          ls -lh "${{ github.workspace }}/zap-reports/"*.sarif 2>/dev/null || echo "No SARIF files"
+          echo "=== Baseline SARIF preview (first 30 lines) ==="
+          head -30 "${{ github.workspace }}/zap-reports/zap-baseline.sarif" || true
 
       # ── Upload SARIF to GitHub Security tab (CodeQL v4) ───────────────────
       - name: Upload ZAP Baseline SARIF
