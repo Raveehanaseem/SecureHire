@@ -1,194 +1,198 @@
 name: SecureHire DevSecOps Pipeline
 
 on:
-push:
-branches:
-- main
-- develop
-- Testing
-
-pull_request:
-branches:
-- main
+  push:
+    branches:
+      - main
+      - develop
+      - Testing
+  pull_request:
+    branches:
+      - main
 
 jobs:
+  validate-structure:
+    name: Validate Repository Structure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-validate-structure:
-name: Validate Repository Structure
-runs-on: ubuntu-latest
+      - name: Show Repository Structure
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -type d | sort
 
-```
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+  sast:
+    name: SAST - CodeQL Analysis
+    runs-on: ubuntu-latest
+    needs: validate-structure
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-  - name: Show Repository Structure
-    run: |
-      pwd
-      ls -la
-      find . -maxdepth 3 -type d | sort
-```
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-sast:
-name: SAST - CodeQL Analysis
-runs-on: ubuntu-latest
-needs: validate-structure
+      - name: Install Backend Dependencies
+        run: |
+          cd securehire/src/backend
+          pip install -r requirements.txt
 
-```
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
 
-  - name: Setup Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.11"
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
 
-  - name: Install Backend Dependencies
-    run: |
-      cd securehire/src/backend
-      pip install -r requirements.txt
+      - name: Perform Analysis
+        uses: github/codeql-action/analyze@v3
 
-  - name: Initialize CodeQL
-    uses: github/codeql-action/init@v3
-    with:
-      languages: python
+  trivy:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    needs: validate-structure
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-  - name: Autobuild
-    uses: github/codeql-action/autobuild@v3
+      - name: Build Backend Image
+        run: |
+          docker build \
+            -f securehire/docker/Dockerfile.backend \
+            -t securehire-backend:test \
+            securehire/src/backend
 
-  - name: Perform Analysis
-    uses: github/codeql-action/analyze@v3
-```
+      - name: Run Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: securehire-backend:test
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
 
-trivy:
-name: Trivy Container Scan
-runs-on: ubuntu-latest
-needs: validate-structure
+  test-backend:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    needs: validate-structure
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: securehire
+          POSTGRES_PASSWORD: securehire123
+          POSTGRES_DB: securehire_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-```
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-  - name: Build Backend Image
-    run: |
-      docker build \
-        -f securehire/docker/Dockerfile.backend \
-        -t securehire-backend:test \
-        securehire/src/backend
+      - name: Install Dependencies
+        run: |
+          cd securehire/src/backend
+          pip install -r requirements.txt
 
-  - name: Run Trivy Scan
-    uses: aquasecurity/trivy-action@master
-    with:
-      image-ref: securehire-backend:test
-      format: table
-      exit-code: 1
-      severity: CRITICAL,HIGH
-```
+      - name: Run Tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://securehire:securehire123@localhost:5432/securehire_db
+          REDIS_URL: redis://localhost:6379
+        run: |
+          if [ -d securehire/tests ]; then
+            pytest securehire/tests -v || true
+          else
+            echo "No tests directory found - skipping"
+          fi
 
-test-backend:
-name: Backend Tests
-runs-on: ubuntu-latest
-needs: validate-structure
+  blue-team:
+    name: Blue Team Validation
+    runs-on: ubuntu-latest
+    needs: test-backend
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-```
-services:
-  postgres:
-    image: postgres:16-alpine
-    env:
-      POSTGRES_USER: securehire
-      POSTGRES_PASSWORD: securehire123
-      POSTGRES_DB: securehire_db
-    ports:
-      - 5432:5432
+      - name: Start Containers
+        run: |
+          cd securehire/docker
+          docker compose up -d || true
+          echo "Waiting 30s for services to start..."
+          sleep 30
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - 6379:6379
+      - name: Health Check
+        run: |
+          curl -sf http://localhost:8000/health || echo "Health check failed"
 
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+      - name: Simulate Attacks
+        run: |
+          echo "=== SQL Injection Test ==="
+          curl -s "http://localhost:8000/api/v1/jobs/?skip=0%20OR%201=1" || true
+          echo "=== XSS Test ==="
+          curl -s "http://localhost:8000/api/v1/jobs/?q=<script>alert(1)</script>" || true
+          echo "=== Unauth Access Test ==="
+          curl -s http://localhost:8000/api/v1/jobs/pending || true
 
-  - name: Setup Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.11"
+      - name: Check Security Logs
+        run: |
+          docker ps -a
+          docker logs securehire-backend 2>&1 | grep -i \
+            'SQL injection\|XSS\|403\|429\|WARNING' || true
 
-  - name: Install Dependencies
-    run: |
-      cd securehire/src/backend
-      pip install -r requirements.txt
+      - name: Tear Down
+        if: always()
+        run: |
+          cd securehire/docker
+          docker compose down || true
 
-  - name: Run Tests
-    env:
-      DATABASE_URL: postgresql+asyncpg://securehire:securehire123@localhost:5432/securehire_db
-      REDIS_URL: redis://localhost:6379
-    run: |
-      if [ -d securehire/tests ]; then
-        pytest securehire/tests -v || true
-      else
-        echo "No tests directory found"
-      fi
-```
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs:
+      - sast
+      - trivy
+      - test-backend
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-blue-team:
-name: Blue Team Validation
-runs-on: ubuntu-latest
-needs: test-backend
+      - name: Build Backend Image
+        run: |
+          docker build \
+            -f securehire/docker/Dockerfile.backend \
+            -t securehire-backend:latest \
+            securehire/src/backend
 
-```
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+      - name: Build Frontend Image
+        run: |
+          docker build \
+            -f securehire/docker/Dockerfile.frontend \
+            -t securehire-frontend:latest \
+            securehire/src/frontend
 
-  - name: Start Containers
-    run: |
-      cd securehire/docker
-      docker compose up -d || true
-      sleep 30
-
-  - name: Simulate Attacks
-    run: |
-      curl -s "http://localhost:8000/api/v1/jobs?search=test" || true
-
-  - name: Check Logs
-    run: |
-      docker ps -a
-      docker logs securehire_backend || true
-```
-
-build:
-name: Build Docker Images
-runs-on: ubuntu-latest
-
-```
-needs:
-  - sast
-  - trivy
-  - test-backend
-
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
-
-  - name: Build Backend Image
-    run: |
-      docker build \
-        -f securehire/docker/Dockerfile.backend \
-        -t securehire-backend:latest \
-        securehire/src/backend
-
-  - name: Build Frontend Image
-    run: |
-      docker build \
-        -f securehire/docker/Dockerfile.frontend \
-        -t securehire-frontend:latest \
-        securehire/src/frontend
-
-  - name: Verify Images
-    run: |
-      docker images
-```
+      - name: Verify Images
+        run: |
+          docker images | grep securehire
