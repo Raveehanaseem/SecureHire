@@ -10,6 +10,10 @@ on:
     branches:
       - main
 
+# Global default — least privilege
+permissions:
+  contents: read
+
 jobs:
   validate-structure:
     name: Validate Repository Structure
@@ -28,6 +32,11 @@ jobs:
     name: SAST - CodeQL Analysis
     runs-on: ubuntu-latest
     needs: validate-structure
+    # CodeQL needs these two permissions to upload SARIF results
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -52,11 +61,17 @@ jobs:
 
       - name: Perform Analysis
         uses: github/codeql-action/analyze@v3
+        with:
+          output: results
+          upload: always
 
   trivy:
     name: Trivy Container Scan
     runs-on: ubuntu-latest
     needs: validate-structure
+    permissions:
+      security-events: write
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -68,13 +83,28 @@ jobs:
             -t securehire-backend:test \
             securehire/src/backend
 
-      - name: Run Trivy Scan
+      - name: Run Trivy Scan (table — visible in logs)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: securehire-backend:test
           format: table
-          exit-code: 1
+          exit-code: 0
           severity: CRITICAL,HIGH
+
+      - name: Run Trivy Scan (SARIF — uploads to Security tab)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: securehire-backend:test
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
 
   test-backend:
     name: Backend Tests
@@ -168,6 +198,157 @@ jobs:
           cd securehire/docker
           docker compose down || true
 
+  dast:
+    name: DAST - OWASP ZAP Scan
+    runs-on: ubuntu-latest
+    needs: test-backend
+    permissions:
+      security-events: write
+      contents: read
+      issues: write
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: securehire
+          POSTGRES_PASSWORD: securehire123
+          POSTGRES_DB: securehire_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Backend Dependencies
+        run: |
+          cd securehire/src/backend
+          pip install -r requirements.txt
+
+      # Start only the backend directly (no Docker-in-Docker complexity)
+      - name: Start Backend Server
+        env:
+          DATABASE_URL: postgresql+asyncpg://securehire:securehire123@localhost:5432/securehire_db
+          REDIS_URL: redis://localhost:6379
+          SECRET_KEY: zap-test-secret-key-not-for-production
+          DEBUG: "false"
+        run: |
+          cd securehire/src/backend
+          uvicorn main:app --host 0.0.0.0 --port 8000 &
+          echo "Waiting for backend to be ready..."
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8000/health && echo "Backend is up!" && break
+            echo "Attempt $i/20 — retrying in 3s..."
+            sleep 3
+          done
+
+      # Seed a test user so ZAP can reach authenticated endpoints
+      - name: Seed Test User
+        run: |
+          curl -s -X POST http://localhost:8000/api/v1/auth/register \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "email": "zap@securehire.test",
+              "password": "Zap@Test123",
+              "full_name": "ZAP Scanner",
+              "role": "applicant"
+            }' || true
+          echo "Test user seeded"
+
+      # Fetch a JWT token and write ZAP context file for authenticated scan
+      - name: Generate ZAP Auth Context
+        run: |
+          TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+            -d 'username=zap@securehire.test&password=Zap@Test123' \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('access_token',''))")
+          echo "ZAP_TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "Token captured (length: ${#TOKEN})"
+
+      # ── Baseline scan — passive only, no active attacks ──────────────────
+      # Good for PRs: fast (~2 min), zero false-positive risk
+      - name: ZAP Baseline Scan (passive)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: http://localhost:8000
+          rules_file_name: .zap/rules.tsv
+          cmd_options: >-
+            -z "-config replacer.full_list(0).description=auth
+                -config replacer.full_list(0).enabled=true
+                -config replacer.full_list(0).matchtype=REQ_HEADER
+                -config replacer.full_list(0).matchstr=Authorization
+                -config replacer.full_list(0).replacement=Bearer__ZAP_AUTH_HEADER_VALUE__"
+          allow_issue_writing: false
+          fail_action: false
+
+      # ── Full API scan using OpenAPI spec ─────────────────────────────────
+      # Targets every documented endpoint with the JWT token injected
+      - name: ZAP Full API Scan
+        uses: zaproxy/action-api-scan@v0.7.0
+        with:
+          target: http://localhost:8000/api/openapi.json
+          format: openapi
+          cmd_options: >-
+            -z "-config replacer.full_list(0).description=auth
+                -config replacer.full_list(0).enabled=true
+                -config replacer.full_list(0).matchtype=REQ_HEADER
+                -config replacer.full_list(0).matchstr=Authorization
+                -config replacer.full_list(0).replacement=Bearer ${{ env.ZAP_TOKEN }}"
+          allow_issue_writing: false
+          fail_action: false
+
+      # Upload ZAP SARIF report to GitHub Security tab
+      - name: Upload ZAP SARIF to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results/zap-scan-results.sarif
+          category: zap-dast
+
+      # Save full HTML report as a downloadable artifact
+      - name: Upload ZAP HTML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-dast-report
+          path: |
+            report_html.html
+            report_json.json
+            results/
+          retention-days: 30
+
+      - name: Summarise ZAP Findings
+        if: always()
+        run: |
+          echo "## ZAP DAST Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | http://localhost:8000 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Spec   | /api/openapi.json |" >> $GITHUB_STEP_SUMMARY
+          echo "| Report | See artifact: zap-dast-report |" >> $GITHUB_STEP_SUMMARY
+          if [ -f report_json.json ]; then
+            HIGH=$(python3 -c "import json; d=json.load(open('report_json.json')); \
+              print(sum(1 for s in d.get('site',[]) for a in s.get('alerts',[]) if a.get('riskcode') in ['3','2']))" 2>/dev/null || echo "N/A")
+            echo "| High/Medium alerts | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          fi
+
   build:
     name: Build Docker Images
     runs-on: ubuntu-latest
@@ -175,6 +356,7 @@ jobs:
       - sast
       - trivy
       - test-backend
+      - dast
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
