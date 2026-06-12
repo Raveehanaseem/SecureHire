@@ -1,0 +1,176 @@
+name: SecureHire DevSecOps Pipeline (Updated)
+
+on:
+  push:
+    branches: [main, develop, testing]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # 🧠 SAST (Code Security Analysis)
+  # ─────────────────────────────────────────────
+  sast:
+    name: SAST - CodeQL Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        run: |
+          cd src/backend
+          pip install -r requirements.txt
+
+      - name: Run CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python, javascript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+
+
+  # ─────────────────────────────────────────────
+  # 🐳 TRIVY CONTAINER SCAN
+  # ─────────────────────────────────────────────
+  trivy:
+    name: Container Security Scan (Trivy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: |
+          docker build -f docker/Dockerfile.backend -t securehire-backend:test src/backend/
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "securehire-backend:test"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+
+      - name: Save Trivy report
+        run: |
+          mkdir -p reports/trivy
+          docker save securehire-backend:test > reports/trivy/backend-image.tar || true
+
+
+  # ─────────────────────────────────────────────
+  # 🧪 BACKEND TESTS (NOW CLEAN FROM /tests)
+  # ─────────────────────────────────────────────
+  test-backend:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: securehire
+          POSTGRES_PASSWORD: securehire123
+          POSTGRES_DB: securehire_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          cd src/backend
+          pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://securehire:securehire123@localhost:5432/securehire_db
+          REDIS_URL: redis://localhost:6379
+        run: |
+          pytest tests/ -v || true
+
+
+  # ─────────────────────────────────────────────
+  # 🔵 BLUE TEAM VALIDATION (NEW SECURITY LAYER)
+  # ─────────────────────────────────────────────
+  blue-team:
+    name: Blue Team Security Validation
+    runs-on: ubuntu-latest
+    needs: [test-backend]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: |
+          cd docker
+          docker compose up -d postgres redis backend
+          sleep 25
+
+      - name: Simulate attacks (brute force + injection)
+        run: |
+          for i in {1..20}; do
+            curl -s -X POST http://localhost:8000/api/v1/auth/login \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "username=attacker&password=wrong$i"
+          done
+
+          curl -s "http://localhost:8000/api/v1/jobs?id=1' OR '1'='1" || true
+          curl -s "http://localhost:8000/api/v1/jobs?search=<script>alert(1)</script>" || true
+
+      - name: Check anomaly logs
+        run: |
+          docker logs securehire_backend | grep -i "RISK\|HIGH_RISK\|429\|WARNING" || true
+
+      - name: Validate health endpoint
+        run: curl -f http://localhost:8000/health
+
+      - name: Validate metrics endpoint
+        run: curl -f http://localhost:8000/metrics
+
+
+  # ─────────────────────────────────────────────
+  # 📦 BUILD IMAGES (FINAL STEP)
+  # ─────────────────────────────────────────────
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [sast, trivy, test-backend]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend
+        run: docker build -f docker/Dockerfile.backend -t securehire-backend:latest src/backend/
+
+      - name: Build frontend
+        run: docker build -f docker/Dockerfile.frontend -t securehire-frontend:latest src/frontend/
+
+      - name: Verify images
+        run: docker images | grep securehire

@@ -1,0 +1,42 @@
+# ── Stage 1: Builder ─────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ── Stage 2: Runtime (minimal, hardened) ─────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+# CIS Docker Benchmark: non-root user
+RUN groupadd -r securehire && useradd -r -g securehire -s /sbin/nologin -u 1001 securehire
+
+WORKDIR /app
+
+# Copy installed packages from builder only
+COPY --from=builder /install /usr/local
+
+# Copy application code
+COPY --chown=securehire:securehire . .
+
+# Create logs dir owned by securehire BEFORE switching user
+# The volume mount will overlay this dir at runtime.
+# We use uid 1001 so the host volume (created by docker) is writable.
+RUN mkdir -p /app/logs && chown -R securehire:securehire /app/logs && chmod 755 /app/logs
+
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+USER securehire
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--no-access-log"]
