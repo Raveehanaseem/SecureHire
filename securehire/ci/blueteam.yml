@@ -1,0 +1,74 @@
+name: SecureHire Blue Team Validation Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # 🛡️ SECURITY VALIDATION (BLUE TEAM CORE)
+  # ─────────────────────────────────────────────
+  security-validation:
+    name: Runtime Security & Anomaly Detection Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start backend stack
+      - name: Start SecureHire stack
+        run: |
+          cd docker
+          docker compose up -d postgres redis backend
+          sleep 25
+
+      # ─────────────────────────────────────────────
+      # 🔥 Attack Simulation (Red Team emulation)
+      # ─────────────────────────────────────────────
+      - name: Simulate brute force attack
+        run: |
+          for i in {1..20}; do
+            curl -s -X POST http://localhost:8000/api/v1/auth/login \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "username=attacker&password=wrong$i"
+          done
+
+      - name: Simulate injection attack
+        run: |
+          curl -s "http://localhost:8000/api/v1/jobs?id=1' OR '1'='1" || true
+          curl -s "http://localhost:8000/api/v1/jobs?search=<script>alert(1)</script>" || true
+
+      # ─────────────────────────────────────────────
+      # 🧠 BLUE TEAM DETECTION CHECK
+      # ─────────────────────────────────────────────
+      - name: Check anomaly detection logs
+        run: |
+          echo "Checking backend logs for security events..."
+          docker logs securehire_backend | grep -i "RISK" || true
+          docker logs securehire_backend | grep -i "HIGH_RISK" || true
+          docker logs securehire_backend | grep -i "429" || true
+          docker logs securehire_backend | grep -i "WARNING" || true
+
+      # ─────────────────────────────────────────────
+      # 📊 VERIFY SECURITY HEADERS & HEALTH
+      # ─────────────────────────────────────────────
+      - name: Validate API health
+        run: |
+          curl -f http://localhost:8000/health
+
+      - name: Validate metrics endpoint
+        run: |
+          curl -f http://localhost:8000/metrics
+
+      # ─────────────────────────────────────────────
+      # ❌ FAIL IF NO SECURITY EVENTS DETECTED
+      # ─────────────────────────────────────────────
+      - name: Ensure anomaly detection is working
+        run: |
+          if ! docker logs securehire_backend | grep -qi "RISK\|429\|WARNING"; then
+            echo "❌ Blue Team failure: No security events detected"
+            exit 1
+          fi
