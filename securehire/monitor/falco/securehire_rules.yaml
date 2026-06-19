@@ -17,7 +17,8 @@
   desc: Alert if a shell is spawned inside any SecureHire container
   condition: >
     container.name startswith "securehire_" and
-    evt.type = execve and
+    evt.type in (execve, execveat) and
+    evt.dir = < and
     proc.name in (bash, sh, zsh, dash, ksh)
   output: >
     Shell spawned in container

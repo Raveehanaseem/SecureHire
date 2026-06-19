@@ -1,0 +1,116 @@
+{
+  "title": "SecureHire — Blue Team Dashboard",
+  "uid": "securehire-blue-team",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (all endpoints)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(securehire_http_requests_total[1m])) by (endpoint)",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "4xx Error Rate (attack attempts)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(securehire_http_requests_total{status_code=~\"4..\"}[1m])) by (status_code)",
+          "legendFormat": "{{status_code}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Rate Limit Hits (429)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(securehire_http_requests_total{status_code=\"429\"}[1m]))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Blocked SQLi/XSS (400s)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(securehire_http_requests_total{status_code=\"400\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Failed Logins by IP",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(securehire_failed_logins_total[1m])) by (ip)",
+          "legendFormat": "{{ip}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Anomaly Alerts by Type",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "sum(increase(securehire_anomaly_alerts_total[1m])) by (alert_type)",
+          "legendFormat": "{{alert_type}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "P95 Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(securehire_http_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Kafka Events Published",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "expr": "sum(rate(securehire_kafka_events_total[1m])) by (topic, event_type)",
+          "legendFormat": "{{topic}} / {{event_type}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Active Redis Sessions",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "targets": [
+        {
+          "expr": "securehire_active_sessions"
+        }
+      ]
+    }
+  ]
+}

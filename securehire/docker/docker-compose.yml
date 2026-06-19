@@ -147,10 +147,12 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin123
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 5s
     ports:
       - "3001:3000"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ../monitor/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
     networks:

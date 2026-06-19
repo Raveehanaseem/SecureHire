@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timezone
 
 from config import settings
+from utils.metrics import kafka_events_total
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ async def publish_event(topic: str, event_type: str, payload: dict):
     """Publish an event to Kafka topic"""
     if not _producer:
         logger.warning(f"Kafka unavailable — skipping event: {event_type}")
+        kafka_events_total.labels(topic=topic, event_type=f"{event_type}_SKIPPED").inc()
         return
 
     event = {
@@ -59,8 +61,10 @@ async def publish_event(topic: str, event_type: str, payload: dict):
     try:
         await _producer.send_and_wait(topic, event)
         logger.info(f"Event published | Topic: {topic} | Type: {event_type}")
+        kafka_events_total.labels(topic=topic, event_type=event_type).inc()
     except KafkaError as e:
         logger.error(f"Kafka publish failed: {e}")
+        kafka_events_total.labels(topic=topic, event_type=f"{event_type}_FAILED").inc()
 
 
 # ─── Event Helpers ─────────────────────────────────────────────────────────────
