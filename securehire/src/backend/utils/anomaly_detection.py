@@ -8,6 +8,7 @@ CYC386 Requirement: AI/ML-powered anomaly detection
 
 import logging
 import json
+import os
 import asyncio
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -22,20 +23,34 @@ _login_attempts: dict = defaultdict(list)  # user_id -> list of (timestamp, ip)
 # Thresholds (tunable)
 BURST_THRESHOLD = 20        # requests per 60s = suspicious
 LOGIN_IP_SWITCH_WINDOW = 300  # 5 min: same user from 2+ IPs = suspicious
-ANOMALY_LOG_FILE = "logs/anomalies.log"
+
+# Resolve the anomaly log path relative to this file's directory (../logs),
+# NOT relative to the process's current working directory. This makes the
+# log land in the same place however/wherever uvicorn is launched from.
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ANOMALY_LOG_FILE = os.path.join(_BACKEND_ROOT, "logs", "anomalies.log")
 
 _anomaly_logger = logging.getLogger("anomaly")
 
 
 def _setup_anomaly_logger():
-    fh = logging.FileHandler(ANOMALY_LOG_FILE, mode="a")
-    fh.setFormatter(logging.Formatter("%(asctime)s | ANOMALY | %(message)s"))
-    _anomaly_logger.addHandler(fh)
+    try:
+        os.makedirs(os.path.dirname(ANOMALY_LOG_FILE), exist_ok=True)
+        fh = logging.FileHandler(ANOMALY_LOG_FILE, mode="a")
+        fh.setFormatter(logging.Formatter("%(asctime)s | ANOMALY | %(message)s"))
+        _anomaly_logger.addHandler(fh)
+    except OSError as e:
+        # Never let logging setup crash the app — fall back to stdout only.
+        logger.error(f"Could not open anomaly log file {ANOMALY_LOG_FILE}: {e}")
     _anomaly_logger.setLevel(logging.WARNING)
     _anomaly_logger.propagate = False
 
 
 _setup_anomaly_logger()
+
+# Imported here (rather than top of file) to avoid any import-order issues
+# with the metrics module during app startup.
+from utils.metrics import anomaly_alerts_total  # noqa: E402
 
 
 class AnomalyDetector:
@@ -58,6 +73,7 @@ class AnomalyDetector:
         if count > BURST_THRESHOLD:
             alert = f"BURST_ATTACK | IP: {ip} | {count} reqs/60s"
             _anomaly_logger.warning(alert)
+            anomaly_alerts_total.labels(alert_type="burst_attack").inc()
             return alert
         return None
 
@@ -79,6 +95,7 @@ class AnomalyDetector:
                 f"IP_SWITCHING | User: {user_id} | IPs in 5min: {unique_ips}"
             )
             _anomaly_logger.warning(alert)
+            anomaly_alerts_total.labels(alert_type="ip_switching").inc()
             return alert
 
         # Off-hours login (22:00 - 05:00 UTC) heuristic
@@ -87,6 +104,7 @@ class AnomalyDetector:
             _anomaly_logger.info(
                 f"OFF_HOURS_LOGIN | User: {user_id} | IP: {ip} | Hour: {hour}:00 UTC"
             )
+            anomaly_alerts_total.labels(alert_type="off_hours_login").inc()
 
         return None
 

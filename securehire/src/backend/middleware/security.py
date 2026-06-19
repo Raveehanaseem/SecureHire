@@ -14,6 +14,8 @@ import bleach
 import logging
 import html
 
+from utils.metrics import anomaly_alerts_total
+
 logger = logging.getLogger(__name__)
 
 # ─── SQL Injection Patterns ───────────────────────────────────────────────────
@@ -92,6 +94,7 @@ class SQLInjectionMiddleware(BaseHTTPMiddleware):
                     f"SQL injection attempt detected | IP: {request.client.host} | "
                     f"Path: {request.url.path} | Param: {key}"
                 )
+                anomaly_alerts_total.labels(alert_type="sql_injection").inc()
                 return JSONResponse(
                     status_code=400,
                     content={"detail": "Invalid input detected"}
@@ -100,6 +103,7 @@ class SQLInjectionMiddleware(BaseHTTPMiddleware):
         # Check path params
         if SQL_PATTERN.search(str(request.url.path)):
             logger.warning(f"SQL injection in path | IP: {request.client.host}")
+            anomaly_alerts_total.labels(alert_type="sql_injection").inc()
             return JSONResponse(
                 status_code=400,
                 content={"detail": "Invalid request"}
@@ -119,6 +123,7 @@ class XSSMiddleware(BaseHTTPMiddleware):
                     f"XSS attempt detected | IP: {request.client.host} | "
                     f"Path: {request.url.path} | Param: {key}"
                 )
+                anomaly_alerts_total.labels(alert_type="xss_attempt").inc()
                 return JSONResponse(
                     status_code=400,
                     content={"detail": "Invalid input detected"}

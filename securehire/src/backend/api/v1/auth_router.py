@@ -20,6 +20,8 @@ from cache.redis_client import get_redis
 from middleware.security import sanitize_input
 from middleware.rate_limit import limiter
 from config import settings
+from utils.metrics import failed_logins_total
+from utils.anomaly_detection import detector as anomaly_detector
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -139,7 +141,9 @@ async def login(
                 user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=LOCKOUT_MINUTES)
                 logger.warning(f"Account locked | User: {user.id}")
             await db.commit()
-        logger.warning(f"Failed login | IP: {request.client.host}")
+        client_ip = request.client.host if request.client else "unknown"
+        logger.warning(f"Failed login | IP: {client_ip}")
+        failed_logins_total.labels(ip=client_ip).inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -148,6 +152,9 @@ async def login(
     user.failed_login_attempts = "0"
     user.locked_until = None
     await db.commit()
+
+    # Feed the login into the anomaly detector (IP-switching / off-hours checks)
+    anomaly_detector.record_login(str(user.id), request.client.host if request.client else "unknown")
 
     access_token = create_access_token({"sub": str(user.id), "role": user.role})
     refresh_token = create_refresh_token(str(user.id))
